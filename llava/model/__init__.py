@@ -1,3 +1,4 @@
+from .language_model.tallava_gemma import TALlavaGemmaForCausalLM, TALlavaConfig
 try:
     from .language_model.llava_llama import LlavaLlamaForCausalLM, LlavaConfig
     from .language_model.llava_mpt import LlavaMptForCausalLM, LlavaMptConfig

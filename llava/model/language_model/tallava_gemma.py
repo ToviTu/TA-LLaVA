@@ -1,15 +1,15 @@
-from email.mime import image
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModel
+from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.gemma2 import Gemma2Config, Gemma2ForCausalLM, Gemma2Model
 
 from ..tallava_arch import TALlavaMetaModel, TALlavaMetaForCausalLM
-from ..multimodal_projector.builder import BimodalIterAttn
+from transformers.generation.utils import GenerateOutput
+
 
 from transformers.cache_utils import Cache, HybridCache
 from transformers.modeling_outputs import (
@@ -51,7 +51,6 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
-        seqlens_in_batch: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -62,6 +61,12 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
         return_dict: Optional[bool] = None,
         num_logits_to_keep: int = 0,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        
+        images = images.to(dtype=self.model.mm_projector.weight.dtype) if images is not None else None
+
+        if use_cache:
+            print("Cache is not supported. Defaulting to False")
+            use_cache = False
 
         output_attentions = (
             output_attentions
@@ -81,6 +86,12 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
             use_cache = False
 
         assert inputs_embeds is None, "inputs_embeds not supported"
+
+        # Create the instruction mask based on the input ids
+        instruction_mask = torch.zeros_like(input_ids)
+        assert torch.all(torch.any(input_ids == 2516, dim=1), dim=0), "'model' token not found in input ids"
+        for i in range(input_ids.shape[0]):
+            instruction_mask[i, : torch.argmax((input_ids[i] == 2516).float())] = 1
 
         # Adjust attention mask length
         attention_mask_ = torch.ones(
@@ -119,6 +130,9 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
                 dtype=inputs_embeds.dtype,
             )
 
+        # Work around: what does this mean???
+        cache_position = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+        position_ids = cache_position.unsqueeze(0)
         if cache_position is None:
             past_seen_tokens = (
                 past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -162,6 +176,8 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
                 position_ids=position_ids,
                 past_key_value=past_key_values,
                 output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
             )
 
             hidden_states = layer_outputs[0]
@@ -175,13 +191,26 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
                 text_embeds = hidden_states[:, self.config.num_learnable_tokens :]
 
                 if i % 2 == 0:
-                    mem_embeds = self.get_model().bottle_neck.text_forward(
-                        mem_embeds, text_embeds
+                    layer_outputs = self.get_model().bottle_neck.text_forward(
+                        src_hidden_states=mem_embeds, 
+                        tgt_hidden_states=text_embeds,
+                        tgt_attention_mask=instruction_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
                     )
+                    mem_embeds = layer_outputs[0]
                 if i % 2 == 1:
-                    mem_embeds = self.get_model().bottle_neck.vis_forward(
-                        mem_embeds, image_embeds
+                    layer_outputs = self.get_model().bottle_neck.vis_forward(
+                        src_hidden_states=mem_embeds, 
+                        tgt_hidden_states=image_embeds,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
                     )
+                    mem_embeds = layer_outputs[0]
 
                 hidden_states = torch.cat((mem_embeds, text_embeds), dim=1)
 
@@ -207,7 +236,11 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits, labels, self.vocab_size)
+            # Resize labels to have the same shape as logits
+            from ...constants import IGNORE_INDEX
+            labels_resized = torch.full_like(attention_mask, IGNORE_INDEX, dtype=torch.long).to(logits.device)
+            labels_resized[:, self.config.num_learnable_tokens:] = labels
+            loss = self.loss_function(logits, labels_resized, self.vocab_size)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -224,35 +257,15 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
     @torch.no_grad()
     def generate(
         self,
-        inputs: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.LongTensor] = None,
         images: Optional[torch.Tensor] = None,
-        image_sizes: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
-        position_ids = kwargs.pop("position_ids", None)
-        attention_mask = kwargs.pop("attention_mask", None)
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
-
-        if images is not None:
-            (inputs, position_ids, attention_mask, _, inputs_embeds, _) = (
-                self.prepare_inputs_labels_for_multimodal(
-                    inputs,
-                    position_ids,
-                    attention_mask,
-                    None,
-                    None,
-                    images,
-                    image_sizes=image_sizes,
-                )
-            )
-        else:
-            inputs_embeds = self.get_model().embed_tokens(inputs)
-
         return super().generate(
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            inputs_embeds=inputs_embeds,
+            input_ids=input_ids,
+            images=images,
             **kwargs,
         )
 
@@ -260,17 +273,14 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
         self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs
     ):
         images = kwargs.pop("images", None)
-        image_sizes = kwargs.pop("image_sizes", None)
         inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
             **kwargs,
         )
         if images is not None:
             inputs["images"] = images
-        if image_sizes is not None:
-            inputs["image_sizes"] = image_sizes
+
         return inputs
 
 
