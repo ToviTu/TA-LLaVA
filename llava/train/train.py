@@ -77,7 +77,7 @@ class ModelArguments:
     mm_vision_select_feature: Optional[str] = field(default="patch")
 
     # New args for TA-LLaVA
-    num_learnable_tokens: int = field(default=64)
+    num_learnable_tokens: int = field(default=32)
 
 
 @dataclass
@@ -213,7 +213,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
 
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
-        keys_to_match = ["mm_projector"]
+        keys_to_match = ["mm_projector", "bottle_neck", "vision_priori"]
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(["embed_tokens", "embed_in"])
 
@@ -496,14 +496,14 @@ def preprocess_gemma_2(
 
     targets = input_ids.clone()
 
-    assert conv.sep_style == conversation_lib.SeparatorStyle.TWO
+    assert conv.sep_style == conversation_lib.SeparatorStyle.GEMMA_2
 
     # Mask targets
-    sep = conv.sep + conv.roles[1] + ": "
+    sep = conv.sep2 + "\n"
     for conversation, target in zip(conversations, targets):
         total_len = int(target.ne(tokenizer.pad_token_id).sum())
 
-        rounds = conversation.split(conv.sep2)
+        rounds = conversation.split(conv.sep2 + "\n" + conv.sep + conv.roles[0])
         cur_len = 1
         target[:cur_len] = IGNORE_INDEX
         for i, rou in enumerate(rounds):
@@ -511,17 +511,19 @@ def preprocess_gemma_2(
                 break
 
             parts = rou.split(sep)
+            assert parts[-1] == "", f"conversation: {conversation}"
+            parts = parts[:-1]
             if len(parts) != 2:
                 break
             parts[0] += sep
 
             if has_image:
-                round_len = len(tokenizer_image_token(rou, tokenizer))
-                instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 2
+                round_len = len(tokenizer_image_token(rou, tokenizer)) - 1
+                instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 1
             else:
-                round_len = len(tokenizer(rou).input_ids)
-                instruction_len = len(tokenizer(parts[0]).input_ids) - 2
-
+                round_len = len(tokenizer(rou).input_ids) - 1
+                instruction_len = len(tokenizer(parts[0]).input_ids) - 1
+            
             if i != 0 and not tokenizer.legacy and IS_TOKENIZER_GREATER_THAN_0_14:
                 round_len -= 1
                 instruction_len -= 1
@@ -950,7 +952,7 @@ class DataCollatorForSupervisedDataset(object):
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
-
+        
         if "image" in instances[0]:
             images = [instance["image"] for instance in instances]
             if all(x is not None and x.shape == images[0].shape for x in images):
@@ -1194,6 +1196,16 @@ def train(attn_implementation=None):
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+    
+    # Print the number of trainable model parameters
+    # Unknown bug with ZeRo3
+    trainable_params = sum(p.numel() for p in model.get_model().parameters() if p.requires_grad)
+    print(f"Total number of trainable parameters: {trainable_params}", flush=True)
+
+    modules = ["mm_projector", "bottle_neck", "vision_priori"]
+    for module in modules:
+        for p in getattr(model.get_model(), module).parameters():
+            assert p.requires_grad
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer

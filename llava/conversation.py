@@ -77,7 +77,7 @@ class Conversation:
                 if message:
                     if type(message) is tuple:
                         message, _, _ = message
-                    ret += self.roles[i%2] + message + self.sep
+                    ret += self.sep + self.roles[i%2] + message + self.sep2 + "\n"
                 else:
                     ret += role
         elif self.sep_style == SeparatorStyle.LLAMA_2:
@@ -267,7 +267,7 @@ conv_gemma2_v1 = Conversation(
     version="gemma2",
     messages=(),
     offset=0,
-    sep_style=SeparatorStyle.TWO,
+    sep_style=SeparatorStyle.GEMMA_2,
     sep="<start_of_turn>",
     sep2="<end_of_turn>"
 )
