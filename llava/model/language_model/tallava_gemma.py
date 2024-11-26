@@ -53,7 +53,7 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
         if kwargs['input_ids'].shape[1] == 1:
             return self.text_forward(**kwargs)
 
-        if "images" in kwargs:
+        if "images" in kwargs and kwargs["images"] is not None:
             return self.vis_forward(**kwargs)
         else:
             return self.text_forward(**kwargs)
@@ -174,7 +174,6 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
         hidden_states = hidden_states * normalizer
 
         # Decoding
-
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
@@ -201,7 +200,7 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
             if i < len(self.get_model().layers) - 1:
                 mem_embeds = hidden_states[:, : self.config.num_learnable_tokens]
                 text_embeds = hidden_states[:, self.config.num_learnable_tokens :]
-
+                
                 if i % 4 == 0:
                     layer_outputs = self.get_model().bottle_neck.text_forward(
                         src_hidden_states=mem_embeds, 
@@ -307,11 +306,19 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
         )
         # Dont pass attention mask to the model
         inputs["attention_mask"] = None
+
         # Recalculate the cache position if there are images
         if past_key_values is not None and images is not None:
-            inputs["cache_position"] = torch.tensor(
-                [past_key_values.get_seq_length()], device=input_ids.device
-            )
+            if past_key_values.get_seq_length()==0:
+                inputs["cache_position"] = torch.arange(
+                    self.config.num_learnable_tokens + input_ids.shape[1], device=input_ids.device
+                )
+            else:
+                inputs["cache_position"] = torch.tensor(
+                    [past_key_values.get_seq_length()], device=input_ids.device
+                )
+                    
+        inputs['position_ids'] = inputs['cache_position'].unsqueeze(0)
         
         if input_ids.shape[1] == 1:
             return inputs
@@ -320,7 +327,10 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
             inputs["images"] = images
         elif pixel_values is not None:
             inputs["images"] = pixel_values
-
+        
+        if inputs['position_ids'].shape == 1:
+            inputs['images'] = None
+        
         return inputs
 
 

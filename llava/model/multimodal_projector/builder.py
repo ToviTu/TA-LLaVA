@@ -104,6 +104,7 @@ class Gemma2XAttention(Gemma2Attention):
         if attention_mask is not None:  # no matter the length, we just slice it
             mask = convert_attention_mask(src_q_len, attention_mask, attn_weights.dtype)
             mask = mask[:, :, :, : key_states.shape[-2]]
+            raise NotImplementedError("Masking not implemented")
             attn_weights = attn_weights + mask
 
         # Attention output
@@ -150,6 +151,7 @@ class Gemma2FlashXAttention(Gemma2FlashAttention2):
         src_bsz, src_q_len, _ = src_hidden_states.size()
         tgt_bsz, tgt_q_len, _ = tgt_hidden_states.size()
 
+        # I remember this wrong but it's actually the other way around
         query_states = self.q_proj(src_hidden_states)
         key_states = self.k_proj(tgt_hidden_states)
         value_states = self.v_proj(tgt_hidden_states)
@@ -239,7 +241,7 @@ class Gemma2EncoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Gemma2XAttention(config, layer_idx=layer_idx) \
-            if config._attn_implementation == "flash_attention_2" \
+            if config._attn_implementation != "flash_attention_2" \
             else Gemma2FlashXAttention(config, layer_idx=layer_idx)
         self.mlp = Gemma2MLP(config)
         self.input_layernorm = Gemma2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
