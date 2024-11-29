@@ -104,7 +104,6 @@ class Gemma2XAttention(Gemma2Attention):
         if attention_mask is not None:  # no matter the length, we just slice it
             mask = convert_attention_mask(src_q_len, attention_mask, attn_weights.dtype)
             mask = mask[:, :, :, : key_states.shape[-2]]
-            raise NotImplementedError("Masking not implemented")
             attn_weights = attn_weights + mask
 
         # Attention output

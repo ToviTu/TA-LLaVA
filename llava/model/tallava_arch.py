@@ -46,6 +46,9 @@ class TALlavaMetaModel:
             self.bottle_neck = BimodalIterAttn(
                 config
             )
+            self.vision_priori = nn.Embedding(
+                config.num_learnable_tokens, config.hidden_size
+            )
 
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
                 self.image_newline = nn.Parameter(
