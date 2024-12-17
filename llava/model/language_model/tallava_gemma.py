@@ -1,15 +1,15 @@
-from email.mime import image
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModel
+from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.gemma2 import Gemma2Config, Gemma2ForCausalLM, Gemma2Model
 
 from ..tallava_arch import TALlavaMetaModel, TALlavaMetaForCausalLM
-from ..multimodal_projector.builder import BimodalIterAttn
+from transformers.generation.utils import GenerateOutput
+
 
 from transformers.cache_utils import Cache, HybridCache
 from transformers.modeling_outputs import (
@@ -47,11 +47,30 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
 
     def forward(
         self,
+        **kwargs,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+
+        if kwargs["input_ids"].shape[1] == 1:
+            return self.text_forward(**kwargs)
+
+        if "images" in kwargs and kwargs["images"] is not None:
+            return self.vis_forward(**kwargs)
+        else:
+            return self.text_forward(**kwargs)
+
+    def text_forward(
+        self,
+        **kwargs,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        # assert "images" not in kwargs, "images should not be in kwargs"
+        return super().forward(**kwargs)
+
+    def vis_forward(
+        self,
         input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,  # 2D or 4D?
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
-        seqlens_in_batch: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -62,6 +81,11 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
         return_dict: Optional[bool] = None,
         num_logits_to_keep: int = 0,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        num_logits_to_keep = (
+            input_ids.shape[1] if num_logits_to_keep == 0 else num_logits_to_keep
+        )
+        assert images is not None, "images should not be None"
+        assert inputs_embeds is None, "inputs_embeds not supported"
 
         output_attentions = (
             output_attentions
@@ -80,9 +104,16 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
         if self.get_model().gradient_checkpointing and self.training and use_cache:
             use_cache = False
 
-        assert inputs_embeds is None, "inputs_embeds not supported"
+        # Create the instruction mask based on the input ids
+        instruction_mask = torch.zeros_like(input_ids)
+        assert torch.all(
+            torch.any(input_ids == 2516, dim=1), dim=0
+        ), "'model' token not found in input ids"
+        for i in range(input_ids.shape[0]):
+            instruction_mask[i, : torch.argmax((input_ids[i] == 2516).float())] = 1
 
         # Adjust attention mask length
+        # Currently assuming 2D attention mask
         attention_mask_ = torch.ones(
             input_ids.shape[0],
             self.config.num_learnable_tokens + input_ids.shape[1],
@@ -93,7 +124,6 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
         attention_mask = attention_mask_
 
         # Forward pass
-
         vis_priori = (
             self.get_model()
             .vision_priori(
@@ -102,9 +132,10 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
             .unsqueeze(0)
             .repeat(input_ids.size(0), 1, 1)
         )
-        image_embeds = self.encode_images(images)
+        image_embeds = self.encode_images(images).to(dtype=self.dtype)
         text_embeds = self.get_model().embed_tokens(input_ids)
 
+        # Concat the visual priori with the text embeddings
         inputs_embeds = torch.cat((vis_priori, text_embeds), dim=1)
 
         # Cache: taken from the original gemma2 implementation
@@ -119,7 +150,12 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
                 dtype=inputs_embeds.dtype,
             )
 
-        if cache_position is None:
+        # Work around: what does this mean???
+        if past_key_values is None:
+            cache_position = torch.arange(
+                inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+        else:
             past_seen_tokens = (
                 past_key_values.get_seq_length() if past_key_values is not None else 0
             )
@@ -128,9 +164,7 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
                 past_seen_tokens + inputs_embeds.shape[1],
                 device=inputs_embeds.device,
             )
-
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+        position_ids = cache_position.unsqueeze(0)
 
         causal_mask = self.get_model()._update_causal_mask(
             attention_mask,
@@ -148,7 +182,6 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
         hidden_states = hidden_states * normalizer
 
         # Decoding
-
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
@@ -162,6 +195,8 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
                 position_ids=position_ids,
                 past_key_value=past_key_values,
                 output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
             )
 
             hidden_states = layer_outputs[0]
@@ -174,14 +209,27 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
                 mem_embeds = hidden_states[:, : self.config.num_learnable_tokens]
                 text_embeds = hidden_states[:, self.config.num_learnable_tokens :]
 
-                if i % 2 == 0:
-                    mem_embeds = self.get_model().bottle_neck.text_forward(
-                        mem_embeds, text_embeds
+                if i % 4 == 0:
+                    layer_outputs = self.get_model().bottle_neck.text_forward(
+                        src_hidden_states=mem_embeds,
+                        tgt_hidden_states=text_embeds,
+                        tgt_attention_mask=instruction_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
                     )
-                if i % 2 == 1:
-                    mem_embeds = self.get_model().bottle_neck.vis_forward(
-                        mem_embeds, image_embeds
+                    mem_embeds = layer_outputs[0]
+                if i % 4 == 1:
+                    layer_outputs = self.get_model().bottle_neck.vis_forward(
+                        src_hidden_states=mem_embeds,
+                        tgt_hidden_states=image_embeds,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
                     )
+                    mem_embeds = layer_outputs[0]
 
                 hidden_states = torch.cat((mem_embeds, text_embeds), dim=1)
 
@@ -221,56 +269,95 @@ class TALlavaGemmaForCausalLM(Gemma2ForCausalLM, TALlavaMetaForCausalLM):
             attentions=all_self_attns,
         )
 
-    # @torch.no_grad()
-    # def generate(
-    #     self,
-    #     inputs: Optional[torch.Tensor] = None,
-    #     images: Optional[torch.Tensor] = None,
-    #     image_sizes: Optional[torch.Tensor] = None,
-    #     **kwargs,
-    # ) -> Union[GenerateOutput, torch.LongTensor]:
-    #     position_ids = kwargs.pop("position_ids", None)
-    #     attention_mask = kwargs.pop("attention_mask", None)
-    #     if "inputs_embeds" in kwargs:
-    #         raise NotImplementedError("`inputs_embeds` is not supported")
+    @torch.no_grad()
+    def generate(
+        self,
+        inputs: Optional[torch.Tensor] = None,
+        images: Optional[torch.Tensor] = None,
+        image_sizes: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Union[GenerateOutput, torch.LongTensor]:
+        position_ids = kwargs.pop("position_ids", None)
+        attention_mask = kwargs.pop("attention_mask", None)
+        if "inputs_embeds" in kwargs:
+            raise NotImplementedError("`inputs_embeds` is not supported")
 
-    #     if images is not None:
-    #         (inputs, position_ids, attention_mask, _, inputs_embeds, _) = (
-    #             self.prepare_inputs_labels_for_multimodal(
-    #                 inputs,
-    #                 position_ids,
-    #                 attention_mask,
-    #                 None,
-    #                 None,
-    #                 images,
-    #                 image_sizes=image_sizes,
-    #             )
-    #         )
-    #     else:
-    #         inputs_embeds = self.get_model().embed_tokens(inputs)
+        if images is not None:
+            (inputs, position_ids, attention_mask, _, inputs_embeds, _) = (
+                self.prepare_inputs_labels_for_multimodal(
+                    inputs,
+                    position_ids,
+                    attention_mask,
+                    None,
+                    None,
+                    images,
+                    image_sizes=image_sizes,
+                )
+            )
+        else:
+            inputs_embeds = self.get_model().embed_tokens(inputs)
 
-    #     return super().generate(
-    #         position_ids=position_ids,
-    #         attention_mask=attention_mask,
-    #         inputs_embeds=inputs_embeds,
-    #         **kwargs,
-    #     )
-
-    def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs
-    ):
-        images = kwargs.pop("images", None)
-        image_sizes = kwargs.pop("image_sizes", None)
-        inputs = super().prepare_inputs_for_generation(
-            input_ids,
-            past_key_values=past_key_values,
+        return super().generate(
+            position_ids=position_ids,
+            attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
+        position_ids=None,
+        use_cache=True,
+        num_logits_to_keep=None,
+        pixel_values=None,
+        images=None,
+        **kwargs,
+    ):
+        inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            position_ids=position_ids,
+            use_cache=use_cache,
+            num_logits_to_keep=num_logits_to_keep,
+            pixel_values=pixel_values,
+            **kwargs,
+        )
+        # Dont pass attention mask to the model
+        inputs["attention_mask"] = None
+
+        # Recalculate the cache position if there are images
+        if past_key_values is not None and images is not None:
+            if past_key_values.get_seq_length() == 0:
+                inputs["cache_position"] = torch.arange(
+                    self.config.num_learnable_tokens + input_ids.shape[1],
+                    device=input_ids.device,
+                )
+            else:
+                inputs["cache_position"] = torch.tensor(
+                    [past_key_values.get_seq_length()], device=input_ids.device
+                )
+
+        inputs["position_ids"] = inputs["cache_position"].unsqueeze(0)
+
+        if input_ids.shape[1] == 1:
+            return inputs
+
         if images is not None:
             inputs["images"] = images
-        if image_sizes is not None:
-            inputs["image_sizes"] = image_sizes
+        elif pixel_values is not None:
+            inputs["images"] = pixel_values
+
+        if inputs["position_ids"].shape == 1:
+            inputs["images"] = None
+
         return inputs
 
 

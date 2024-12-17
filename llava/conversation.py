@@ -13,6 +13,7 @@ class SeparatorStyle(Enum):
     MPT = auto()
     PLAIN = auto()
     LLAMA_2 = auto()
+    GEMMA_2 = auto()
 
 
 @dataclasses.dataclass
@@ -68,6 +69,15 @@ class Conversation:
                     if type(message) is tuple:
                         message, _, _ = message
                     ret += role + message + self.sep
+                else:
+                    ret += role
+        elif self.sep_style == SeparatorStyle.GEMMA_2:
+            ret = ""
+            for i, (role, message) in enumerate(messages):
+                if message:
+                    if type(message) is tuple:
+                        message, _, _ = message
+                    ret += self.sep + self.roles[i%2] + message + self.sep2 + "\n"
                 else:
                     ret += role
         elif self.sep_style == SeparatorStyle.LLAMA_2:
@@ -251,6 +261,17 @@ conv_vicuna_v1 = Conversation(
     sep2="</s>",
 )
 
+conv_gemma2_v1 = Conversation(
+    system="",
+    roles=("user\n", "model\n"),
+    version="gemma2",
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.GEMMA_2,
+    sep="<start_of_turn>",
+    sep2="<end_of_turn>"
+)
+
 conv_llama_2 = Conversation(
     system="""You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.
 
@@ -387,6 +408,8 @@ conv_templates = {
     "llava_v1": conv_llava_v1,
     "v1_mmtag": conv_llava_v1_mmtag,
     "llava_llama_2": conv_llava_llama_2,
+
+    "gemma_2": conv_gemma2_v1,
 
     "mpt": conv_mpt,
 }

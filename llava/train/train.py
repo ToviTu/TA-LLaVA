@@ -77,8 +77,7 @@ class ModelArguments:
     mm_vision_select_feature: Optional[str] = field(default="patch")
 
     # New args for TA-LLaVA
-    num_learnable_tokens: int = field(default=64)
-    num_xattn_heads: int = field(default=8)
+    num_learnable_tokens: int = field(default=32)
 
 
 @dataclass
@@ -214,7 +213,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
 
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
-        keys_to_match = ["mm_projector"]
+        keys_to_match = ["mm_projector", "bottle_neck", "vision_priori"]
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(["embed_tokens", "embed_in"])
 
@@ -453,6 +452,99 @@ def preprocess_llama_2(
         labels=targets,
     )
 
+
+def preprocess_gemma_2(
+    sources, tokenizer: transformers.PreTrainedTokenizer, has_image: bool = False
+) -> Dict:
+    conv = conversation_lib.default_conversation.copy()
+    roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+
+    # Apply prompt templates
+    conversations = []
+    for i, source in enumerate(sources):
+        if roles[source[0]["from"]] != conv.roles[0]:
+            # Skip the first one if it is not from human
+            source = source[1:]
+
+        conv.messages = []
+        for j, sentence in enumerate(source):
+            role = roles[sentence["from"]]
+            assert role == conv.roles[j % 2], f"{i}"
+            seq = sentence["value"]
+            seq = seq.replace(DEFAULT_IMAGE_TOKEN, "") # Gemma2 does not have image token
+            conv.append_message(role, seq)
+        conversations.append(conv.get_prompt())
+
+    # Tokenize conversations
+
+    if has_image:
+        input_ids = torch.stack(
+            [
+                tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
+                for prompt in conversations
+            ],
+            dim=0,
+        )
+    else:
+        input_ids = tokenizer(
+            conversations,
+            return_tensors="pt",
+            padding="longest",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+        ).input_ids
+
+    targets = input_ids.clone()
+
+    assert conv.sep_style == conversation_lib.SeparatorStyle.GEMMA_2
+
+    # Mask targets
+    sep = conv.sep2 + "\n"
+    for conversation, target in zip(conversations, targets):
+        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+
+        rounds = conversation.split(conv.sep2 + "\n" + conv.sep + conv.roles[0])
+        cur_len = 1
+        target[:cur_len] = IGNORE_INDEX
+        for i, rou in enumerate(rounds):
+            if rou == "":
+                break
+
+            parts = rou.split(sep)
+            assert parts[-1] == "", f"conversation: {conversation}"
+            parts = parts[:-1]
+            if len(parts) != 2:
+                break
+            parts[0] += sep
+
+            if has_image:
+                round_len = len(tokenizer_image_token(rou, tokenizer)) - 1
+                instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 1
+            else:
+                round_len = len(tokenizer(rou).input_ids) - 1
+                instruction_len = len(tokenizer(parts[0]).input_ids) - 1
+            
+            if i != 0 and not tokenizer.legacy and IS_TOKENIZER_GREATER_THAN_0_14:
+                round_len -= 1
+                instruction_len -= 1
+
+            target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+
+            cur_len += round_len
+        target[cur_len:] = IGNORE_INDEX
+
+        if cur_len < tokenizer.model_max_length:
+            if cur_len != total_len:
+                target[:] = IGNORE_INDEX
+                print(
+                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
+                    f" (ignored)"
+                )
+
+    return dict(
+        input_ids=input_ids,
+        labels=targets,
+    )
 
 def preprocess_v1(
     sources, tokenizer: transformers.PreTrainedTokenizer, has_image: bool = False
@@ -697,6 +789,8 @@ def preprocess(
         return preprocess_v1(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "mpt":
         return preprocess_mpt(sources, tokenizer, has_image=has_image)
+    if conversation_lib.default_conversation.version == "gemma2":
+        return preprocess_gemma_2(sources, tokenizer, has_image=has_image)
     # add end signal and concatenate together
     conversations = []
     for source in sources:
@@ -858,7 +952,7 @@ class DataCollatorForSupervisedDataset(object):
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
-
+        
         if "image" in instances[0]:
             images = [instance["image"] for instance in instances]
             if all(x is not None and x.shape == images[0].shape for x in images):
@@ -1047,6 +1141,21 @@ def train(attn_implementation=None):
             device=training_args.device,
         )
 
+        model.model.vision_priori.to(
+            dtype=torch.bfloat16 if training_args.bf16 else torch.float16,
+            device=training_args.device,
+        )
+
+        model.model.bottle_neck.to(
+            dtype=torch.bfloat16 if training_args.bf16 else torch.float16,
+            device=training_args.device,
+        )
+
+        model.model.mm_projector.to(
+            dtype=torch.bfloat16 if training_args.bf16 else torch.float16,
+            device=training_args.device,
+        )
+
         data_args.image_processor = vision_tower.image_processor
         data_args.is_multimodal = True
 
@@ -1061,10 +1170,18 @@ def train(attn_implementation=None):
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
+            for p in model.get_model().bottle_neck.parameters():
+                p.requires_grad = True
+            for p in model.get_model().vision_priori.parameters():
+                p.requires_grad = True
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:
             for p in model.get_model().mm_projector.parameters():
+                p.requires_grad = False
+            for p in model.get_model().bottle_neck.parameters():
+                p.requires_grad = False
+            for p in model.get_model().vision_priori.parameters():
                 p.requires_grad = False
 
         if training_args.bits in [4, 8]:
@@ -1079,6 +1196,16 @@ def train(attn_implementation=None):
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+    
+    # Print the number of trainable model parameters
+    # Unknown bug with ZeRo3
+    trainable_params = sum(p.numel() for p in model.get_model().parameters() if p.requires_grad)
+    print(f"Total number of trainable parameters: {trainable_params}", flush=True)
+
+    modules = ["mm_projector", "bottle_neck", "vision_priori"]
+    for module in modules:
+        for p in getattr(model.get_model(), module).parameters():
+            assert p.requires_grad
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer

@@ -44,7 +44,10 @@ class TALlavaMetaModel:
 
             # Hardcoded for now
             self.bottle_neck = BimodalIterAttn(
-                config.mm_hidden_size, config.hidden_size, config.hidden_size * 4, 8
+                config
+            )
+            self.vision_priori = nn.Embedding(
+                config.num_learnable_tokens, config.hidden_size
             )
 
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
@@ -114,10 +117,7 @@ class TALlavaMetaModel:
         self.config.num_learnable_tokens = num_learnable_tokens
         if getattr(self, "bottle_neck", None) is None:
             self.bottle_neck = BimodalIterAttn(
-                self.config.mm_hidden_size,
-                self.config.hidden_size,
-                self.config.hidden_size * 4,
-                8,
+                self.config
             )
 
         if getattr(self, "vision_priori", None) is None:
